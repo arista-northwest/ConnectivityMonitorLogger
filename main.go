@@ -7,34 +7,56 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
-	"log"
-	"log/syslog"
-	"os"
+
 	"path"
 	"reflect"
 	"strings"
 	"time"
 
+	"log"
+
+	"github.com/arista-northwest/ConnectivityMonitorLogger/logger"
 	"github.com/aristanetworks/goarista/gnmi"
 	pb "github.com/openconfig/gnmi/proto/gnmi"
 )
 
-const Path = "/Sysdb/connectivityMonitor/status/hostStatus"
+var (
+	cfg         = &gnmi.Config{TLS: true}
+	subOpts     = &gnmi.SubscribeOptions{}
+	query       = "/Sysdb/connectivityMonitor/status/hostStatus"
+	eventLogger interface{}
 
-var help = `Usage of ConnectivityMonitorLogger:
-`
+	rttBaselines   = make(map[string]float32)
+	monitorMetrics = make(map[string]*monitorMetric)
+	triggerStates  = make(map[string]*triggerState)
 
-var TriggerCount uint
-var RearmCount uint
-var EventLogger *syslog.Writer
-var RTTThreshold float64
-var LossThreshold uint64
+	eosNative = flag.Bool("eos_native", false, "set to true if 'eos_native' is enabled under 'management api gnmi'")
+	interval  = flag.Uint64("interval", 5, "Set to interval configured under 'monitor connectivity (default is 5")
 
-//var RTTBaselines map[string]*float32
-var MonitorMetrics map[string]*MonitorMetric
+	triggerCount = flag.Uint("trigger_count", 3, "Number of events to trigger an alert (default is 3)")
+	rearmCount   = flag.Uint("rearm_count", 2, "Number of events to rearm a previously triggered alert (default is 2)")
 
-type MonitorMetric struct {
+	rttBaselineTrigger    = flag.Uint("rtt_baseline_trigger", 10, "Sets a new baseline after N deviations from old baseline")
+	rttDeviationThreshold = flag.Uint64("rtt_deviation_threshold", 10, "Percent RTT deviation above or below baseline")
+	rttThreshold          = flag.Float64("rtt_threshold", 0, "Absolute absolute value for RTT")
+	lossThreshold         = flag.Uint64("loss_threshold", 0.0, "Perect of lost packets to tolerate")
+
+	// Certificate files.
+	insecure = flag.Bool("insecure", false, "use insecure GRPC connection.")
+	// caCert     = flag.String("ca_crt", "", "CA certificate file. Used to verify server TLS certificate.")
+	// clientCert = flag.String("client_crt", "", "Client certificate file. Used for client certificate-based authentication.")
+	// clientKey  = flag.String("client_key", "", "Client private key file. Used for client certificate-based authentication.")
+	// //insecureSkipVerify = flag.Bool("tls_skip_verify", false, "When set, CLI will not verify the server certificate during TLS handshake.")
+
+	logInit        = logger.LogD("CONNECTIVITYMONITOR_INIT", logger.INFO, "Agent Initialized", "Agent has been initialized", logger.NoActionRequired, time.Duration(time.Second*10), 10)
+	logRttTrigger  = logger.LogD("CONNECTIVITYMONITOR_RTT_TRIGGER", logger.NOTICE, "RTT triggered event on %s rtt:%.2fms threshold:%.2fms", "", logger.NoActionRequired, time.Duration(time.Second), 10)
+	logRttRearm    = logger.LogD("CONNECTIVITYMONITOR_RTT_REARM", logger.NOTICE, "RTT rearmed event on %s rtt:%.2fms", "", logger.NoActionRequired, time.Duration(time.Second*10), 10)
+	logLossTrigger = logger.LogD("CONNECTIVITYMONITOR_LOSS_TRIGGER", logger.NOTICE, "Packet loss triggered event on %s loss:%d%% threshold:%d%%", "", logger.NoActionRequired, time.Duration(time.Second*10), 10)
+	loglossRearm   = logger.LogD("CONNECTIVITYMONITOR_LOSS_REARM", logger.NOTICE, "Packet loss rearmed event on %s loss:%d%%", "", logger.NoActionRequired, time.Duration(time.Second*10), 10)
+	logRttBaseline = logger.LogD("CONNECTIVITYMONITOR_RTT_BASELINE", logger.NOTICE, "Setting new baseline on %s to %.2f was %.2f", "", logger.NoActionRequired, time.Duration(time.Second*10), 10)
+)
+
+type monitorMetric struct {
 	Timestamp        string  `alias:"timestamp"`
 	HostName         string  `alias:"hostName"`
 	VRF              string  `alias:"vrfName"`
@@ -46,100 +68,129 @@ type MonitorMetric struct {
 	HTTPResponseTime float32 `alias:"httpResponseTime"`
 }
 
-// type Machine struct {
-// 	current int32
-// }
-
-var TriggerStates map[string]*TriggerState
-
 const (
 	Armed = iota
 	Triggered
-	Rearming
-	Triggering
 )
 
-type TriggerState struct {
+type triggerState struct {
 	current int32
 	offset  uint
 }
 
-func (t *TriggerState) trigger(max uint) int32 {
+func (t *triggerState) trigger(max uint) bool {
 	if t.current == Triggered {
-		return Triggered
+		return false
 	}
 	t.offset += 1
 	if t.offset >= max {
 		t.current = Triggered
 		t.offset = 0
-		return Triggering
+		return true
 	}
 
-	return Armed
+	return false
 }
 
-func (t *TriggerState) rearm(max uint) int32 {
+func (t *triggerState) rearm(max uint) bool {
 	if t.current == Armed {
-		return Armed
+		return false
 	}
 	t.offset += 1
 	if t.offset >= max {
 		t.current = Armed
 		t.offset = 0
-		return Rearming
+		return true
 	}
 
-	return Triggered
+	return false
 }
 
-func transitionTriggerState(key string, raise bool) int32 {
+func init() {
+	flag.StringVar(&cfg.Addr, "address", "localhost:6030", "Address of the GNMI target to query.")
+	flag.StringVar(&cfg.Username, "username", "admin", "")
+	flag.StringVar(&cfg.Password, "password", "", "")
+	flag.StringVar(&cfg.CAFile, "cafile", "", "Path to server TLS certificate file")
+	flag.StringVar(&cfg.CertFile, "certfile", "", "Path to client TLS certificate file")
+	flag.StringVar(&cfg.KeyFile, "keyfile", "", "Path to client TLS private key file")
+	flag.BoolVar(&cfg.TLS, "tls", false, "Enable TLS")
+	logInit()
+}
 
-	if _, ok := TriggerStates[key]; !ok {
-		TriggerStates[key] = &TriggerState{}
+func main() {
+	flag.Parse()
+	var err error
+
+	subOpts.Paths = gnmi.SplitPaths([]string{query})
+	subOpts.StreamMode = "target_defined"
+	subOpts.Mode = "stream"
+
+	if *eosNative == true {
+		subOpts.Origin = "eos_native"
 	}
 
-	s := TriggerStates[key]
+	ctx := gnmi.NewContext(context.Background(), cfg)
+	client, err := gnmi.Dial(cfg)
+	if err != nil {
+		log.Fatalf("Failed to dial: %v", err)
+	}
+
+	respChan := make(chan *pb.SubscribeResponse, 10)
+	errChan := make(chan error, 10)
+	defer close(errChan)
+
+	go func() {
+		if err := gnmi.SubscribeErr(ctx, client, subOpts, respChan); err != nil {
+			errChan <- err
+		}
+	}()
+
+	firstPass := true
+
+	for {
+		select {
+		case resp, open := <-respChan:
+			if !open {
+				// will read the error from the channel later
+				continue
+			}
+
+			sync, err := collectResposes(resp)
+			if err != nil {
+				log.Fatal("Failed to collect responses: ", err)
+			}
+			if sync == true || firstPass == false {
+				firstPass = false
+
+				handleEvents(monitorMetrics)
+			}
+		case err := <-errChan:
+			log.Fatal(err)
+		case <-time.After(time.Second * time.Duration(*interval+1)):
+			// if there are no changes in the interval period to response will be sent.
+			// In this case assume the data has not changed
+			handleEvents(monitorMetrics)
+		}
+
+	}
+}
+
+func transitionTriggerState(key string, raise bool, trigger_count uint, rearm_count uint) bool {
+
+	if _, ok := triggerStates[key]; !ok {
+		triggerStates[key] = &triggerState{}
+	}
+
+	s := triggerStates[key]
 
 	switch raise {
 	case true:
-		return s.trigger(TriggerCount)
+		return s.trigger(trigger_count)
 	case false:
-		return s.rearm(RearmCount)
+		return s.rearm(rearm_count)
 	}
 
-	return s.current
-}
-
-func logEvents(metrics map[string]*MonitorMetric) {
-	for k, m := range metrics {
-		EventLogger.Debug(fmt.Sprintf("Received a message on %s: %+v", k, m))
-		logRTTEvent(k, m)
-		logLossEvent(k, m)
-	}
-}
-
-func logRTTEvent(k string, m *MonitorMetric) {
-	if m.Latency >= float32(RTTThreshold) {
-		if transitionTriggerState(k+":rtt", true) == Triggering {
-			EventLogger.Notice(fmt.Sprintf("RTT triggered event on %s rtt:%.2fms threshold:%.2fms", m.HostName, m.Latency, RTTThreshold))
-		}
-	} else if m.Latency < float32(RTTThreshold) {
-		if transitionTriggerState(k+":rtt", false) == Rearming {
-			EventLogger.Notice(fmt.Sprintf("RTT rearmed event on %s rtt:%.2fms", m.HostName, m.Latency))
-		}
-	}
-}
-
-func logLossEvent(k string, m *MonitorMetric) {
-	if m.PacketLoss > LossThreshold {
-		if transitionTriggerState(k+":loss", true) == Triggering {
-			EventLogger.Notice(fmt.Sprintf("Packet loss triggered event on %s loss:%d%% threshold:%d%%", m.HostName, m.PacketLoss, LossThreshold))
-		}
-	} else if m.PacketLoss < LossThreshold {
-		if transitionTriggerState(k+":loss", false) == Rearming {
-			EventLogger.Notice(fmt.Sprintf("Packet loss rearmed event on %s loss:%d%%", m.HostName, m.PacketLoss))
-		}
-	}
+	return false
 }
 
 func collectResposes(response *pb.SubscribeResponse) (bool, error) {
@@ -169,12 +220,12 @@ func collectResposes(response *pb.SubscribeResponse) (bool, error) {
 			// get last elem
 			last := elems[len(elems)-1]
 
-			field, ok := getMonitorMetricFieldByAlias(MonitorMetric{}, last)
+			field, ok := getMonitorMetricFieldByAlias(monitorMetric{}, last)
 			if ok != true {
 				continue
 			}
-			if _, ok := MonitorMetrics[key]; !ok {
-				MonitorMetrics[key] = &MonitorMetric{
+			if _, ok := monitorMetrics[key]; !ok {
+				monitorMetrics[key] = &monitorMetric{
 					Timestamp: timestamp,
 				}
 			}
@@ -186,7 +237,7 @@ func collectResposes(response *pb.SubscribeResponse) (bool, error) {
 				continue
 			}
 
-			err = setMonitorMetricFieldByName(MonitorMetrics[key], field, value)
+			err = setMonitorMetricFieldByName(monitorMetrics[key], field, value)
 			if err != nil {
 				log.Printf("Failed to set value: %s", err)
 				continue
@@ -197,7 +248,7 @@ func collectResposes(response *pb.SubscribeResponse) (bool, error) {
 	return false, nil
 }
 
-func setMonitorMetricFieldByName(message *MonitorMetric, field string, value interface{}) error {
+func setMonitorMetricFieldByName(message *monitorMetric, field string, value interface{}) error {
 
 	f := reflect.ValueOf(message).Elem().FieldByName(field)
 	if f.IsValid() {
@@ -215,8 +266,8 @@ func setMonitorMetricFieldByName(message *MonitorMetric, field string, value int
 	return nil
 }
 
-func getMonitorMetricFieldByAlias(message MonitorMetric, alias string) (string, bool) {
-	t := reflect.TypeOf(MonitorMetric{})
+func getMonitorMetricFieldByAlias(message monitorMetric, alias string) (string, bool) {
+	t := reflect.TypeOf(monitorMetric{})
 
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
@@ -230,81 +281,71 @@ func getMonitorMetricFieldByAlias(message MonitorMetric, alias string) (string, 
 	return "", false
 }
 
-func main() {
-	var err error
-	cfg := &gnmi.Config{}
-	subOpts := &gnmi.SubscribeOptions{}
+func handleEvents(metrics map[string]*monitorMetric) {
 
-	TriggerStates = make(map[string]*TriggerState)
-	MonitorMetrics = make(map[string]*MonitorMetric)
-
-	flag.StringVar(&cfg.Addr, "addr", "localhost:6030", "Sets the gNMI target (default is localhost:6030")
-	flag.StringVar(&cfg.Username, "username", "admin", "Sets the gNMI user (default is admin)")
-	flag.StringVar(&cfg.Password, "password", "", "Sets the gNMI password (default is <blank>)")
-
-	flag.Uint64Var(&LossThreshold, "loss_threshold", 0.0, "Perect of lost packets to tolerate")
-	flag.Float64Var(&RTTThreshold, "rtt_threshold", 10, "Percent deviation for RTT")
-	flag.UintVar(&TriggerCount, "trigger_count", 3, "Number of events to trigger an alert (default is 3)")
-	flag.UintVar(&RearmCount, "rearm_count", 2, "Number of events to rearm a previously triggered alert (default is 2)")
-	eosNative := flag.Bool("eos_native", false, "set to true if 'eos_native' is enabled under 'management api gnmi'")
-	interval := flag.Uint64("interval", 5, "Set to interval configured under 'monitor connectivity (default is 5")
-
-	flag.Parse()
-
-	subOpts.Paths = gnmi.SplitPaths([]string{Path})
-
-	if *eosNative == true {
-		subOpts.Origin = "eos_native"
+	for k, m := range metrics {
+		setRTTBaseline(k, m.Latency)
+		logRTTEvent(k, m)
+		logLossEvent(k, m)
 	}
+}
 
-	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, help)
-		flag.PrintDefaults()
+func logRTTEvent(k string, m *monitorMetric) {
+	if *rttThreshold == float64(0) {
+		return
 	}
-
-	EventLogger, err = syslog.New(syslog.LOG_LOCAL4, "ConnectivityMonitorLogger")
-	if err != nil {
-		log.Fatal("Fail to setup syslogger")
-	}
-
-	log.SetOutput(EventLogger)
-
-	ctx := gnmi.NewContext(context.Background(), cfg)
-	client, err := gnmi.Dial(cfg)
-	if err != nil {
-		log.Fatal("Failed to connect: ", err)
-	}
-
-	respChan := make(chan *pb.SubscribeResponse, 10)
-	errChan := make(chan error, 10)
-	defer close(errChan)
-
-	go gnmi.Subscribe(ctx, client, subOpts, respChan, errChan)
-
-	firstPass := true
-
-	for {
-		select {
-		case resp, open := <-respChan:
-			if !open {
-				log.Fatal("Failed to open a response channel")
-			}
-
-			sync, err := collectResposes(resp)
-			if err != nil {
-				log.Fatal("Failed to collect responses: ", err)
-			}
-			if sync == true || firstPass == false {
-				firstPass = false
-
-				logEvents(MonitorMetrics)
-			}
-		case err := <-errChan:
-			log.Fatal("gRPC error received: ", err)
-		case <-time.After(time.Second * time.Duration(*interval+1)):
-			// if there are no changes in the interval period to response will be sent.
-			// In this case assume the data has not changed
-			logEvents(MonitorMetrics)
+	if m.Latency >= float32(*rttThreshold) {
+		if transitionTriggerState(k+":rtt", true, *triggerCount, *rearmCount) {
+			logRttTrigger(m.HostName, m.Latency, *rttThreshold)
+		}
+	} else if m.Latency < float32(*rttThreshold) {
+		if transitionTriggerState(k+":rtt", false, *triggerCount, *rearmCount) {
+			logRttRearm(m.HostName, m.Latency)
 		}
 	}
+}
+
+func logLossEvent(k string, m *monitorMetric) {
+
+	if m.PacketLoss > *lossThreshold {
+		if transitionTriggerState(k+":loss", true, *triggerCount, *rearmCount) {
+			logLossTrigger(m.HostName, m.PacketLoss, lossThreshold)
+		}
+	} else if m.PacketLoss < *lossThreshold {
+		if transitionTriggerState(k+":loss", false, *triggerCount, *rearmCount) {
+			loglossRearm(m.HostName, m.PacketLoss)
+		}
+	}
+}
+
+func setRTTBaseline(k string, rtt float32) {
+	if _, ok := rttBaselines[k]; !ok {
+		logRttBaseline(k, rtt, float32(0))
+		rttBaselines[k] = rtt
+	}
+
+	baseline := rttBaselines[k]
+	hi := baseline * (1 + float32(*rttDeviationThreshold)/100)
+	lo := baseline * (1 - float32(*rttDeviationThreshold)/100)
+
+	if rtt <= lo {
+		transitionTriggerState(k+":rtt_baseline_hi", false, *rttBaselineTrigger, 1)
+
+		if transitionTriggerState(k+":rtt_baseline_lo", true, *rttBaselineTrigger, 0) {
+			logRttBaseline(k, rtt, baseline)
+			rttBaselines[k] = rtt
+		}
+	} else if rtt >= hi {
+		transitionTriggerState(k+":rtt_baseline_lo", false, *rttBaselineTrigger, 1)
+
+		if transitionTriggerState(k+":rtt_baseline_hi", true, *rttBaselineTrigger, 0) {
+			logRttBaseline(k, rtt, baseline)
+			rttBaselines[k] = rtt
+		}
+	} else {
+		transitionTriggerState(k+":rtt_baseline_lo", false, *rttBaselineTrigger, 1)
+		transitionTriggerState(k+":rtt_baseline_hi", false, *rttBaselineTrigger, 1)
+	}
+
+	log.Printf("%+v\n", triggerStates)
 }
